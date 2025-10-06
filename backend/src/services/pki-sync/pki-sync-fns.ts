@@ -156,7 +156,6 @@ const checkPkiSyncDestination = (pkiSync: TPkiSyncWithCredentials, destination: 
 export const PkiSyncFns = {
   getCertificates: async (
     pkiSync: TPkiSyncWithCredentials,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     dependencies: {
       appConnectionDAL: Pick<TAppConnectionDALFactory, "findById" | "updateById">;
       kmsService: Pick<TKmsServiceFactory, "createCipherPairWithDataKey">;
@@ -169,9 +168,9 @@ export const PkiSyncFns = {
         );
       }
       case PkiSync.AwsCertificateManager: {
-        throw new Error(
-          "AWS Certificate Manager does not support importing certificates into Infisical (private keys cannot be extracted)"
-        );
+        checkPkiSyncDestination(pkiSync, PkiSync.AwsCertificateManager);
+        const awsCertificateManagerPkiSync = awsCertificateManagerPkiSyncFactory(dependencies);
+        return awsCertificateManagerPkiSync.getCertificates(pkiSync);
       }
       default:
         throw new Error(`Unsupported PKI sync destination: ${String(pkiSync.destination)}`);

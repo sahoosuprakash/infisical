@@ -22,6 +22,7 @@ import { TCertificateBodyDALFactory } from "../certificate/certificate-body-dal"
 import { TCertificateDALFactory } from "../certificate/certificate-dal";
 import { getCertificateCredentials } from "../certificate/certificate-fns";
 import { TCertificateSecretDALFactory } from "../certificate/certificate-secret-dal";
+import { CertStatus } from "../certificate/certificate-types";
 import { TCertificateAuthorityCertDALFactory } from "../certificate-authority/certificate-authority-cert-dal";
 import { TCertificateAuthorityDALFactory } from "../certificate-authority/certificate-authority-dal";
 import { getCaCertChain } from "../certificate-authority/certificate-authority-fns";
@@ -57,7 +58,7 @@ type TPkiSyncQueueFactoryDep = {
   licenseService: Pick<TLicenseServiceFactory, "getPlan">;
   certificateDAL: Pick<
     TCertificateDALFactory,
-    "findLatestActiveCertForSubscriber" | "findAllActiveCertsForSubscriber" | "create"
+    "findLatestActiveCertForSubscriber" | "findAllActiveCertsForSubscriber" | "create" | "transaction" | "find"
   >;
   certificateBodyDAL: Pick<TCertificateBodyDALFactory, "findOne" | "create">;
   certificateSecretDAL: Pick<TCertificateSecretDALFactory, "findOne" | "create">;
@@ -318,8 +319,141 @@ export const pkiSyncQueueFactory = ({
       removeOnFail: true
     });
 
-  const $importCertificates = async (): Promise<TCertificateMap> => {
-    throw new Error("Certificate import functionality is not implemented");
+  const $importCertificates = async (
+    _job: TPkiSyncImportCertificatesDTO,
+    pkiSync: TPkiSyncRaw
+  ): Promise<TCertificateMap> => {
+    const {
+      connection: { orgId, encryptedCredentials, projectId: appConnectionProjectId }
+    } = pkiSync;
+
+    const credentials = await decryptAppConnectionCredentials({
+      orgId,
+      encryptedCredentials,
+      kmsService,
+      projectId: appConnectionProjectId
+    });
+
+    const pkiSyncWithCredentials = {
+      ...pkiSync,
+      connection: {
+        ...pkiSync.connection,
+        credentials
+      }
+    } as TPkiSyncWithCredentials;
+
+    const certificateMap = await PkiSyncFns.getCertificates(pkiSyncWithCredentials, {
+      appConnectionDAL,
+      kmsService
+    });
+
+    const createdCertificates: string[] = [];
+    const failedCertificates: Array<{ name: string; error: string }> = [];
+
+    for (const [certName, certData] of Object.entries(certificateMap)) {
+      try {
+        // Skip certificates that don't have private key (not exportable from AWS)
+        if (!certData.privateKey) {
+          // eslint-disable-next-line no-continue
+          continue;
+        }
+
+        const leafCert = new x509.X509Certificate(certData.cert);
+        const commonName = Array.from(leafCert.subjectName.getField("CN")?.values() || [])[0] || "";
+
+        let altNames: undefined | string;
+        const sanExtension = leafCert.extensions.find((ext) => ext.type === "2.5.29.17");
+        if (sanExtension) {
+          const sanNames = new x509.GeneralNames(sanExtension.value);
+          altNames = sanNames.items.map((name) => name.value).join(", ");
+        }
+
+        const { serialNumber, notBefore, notAfter } = leafCert;
+
+        // Check if certificate with same serial number already exists in this project
+        const existingCerts = await certificateDAL.find({
+          serialNumber,
+          projectId: pkiSync.projectId
+        });
+
+        if (existingCerts.length > 0) {
+          // eslint-disable-next-line no-continue
+          continue;
+        }
+
+        const certificateManagerKeyId = await getProjectKmsCertificateKeyId({
+          projectId: pkiSync.projectId,
+          projectDAL,
+          kmsService
+        });
+
+        const kmsEncryptor = await kmsService.encryptWithKmsKey({
+          kmsId: certificateManagerKeyId
+        });
+
+        const { cipherTextBlob: encryptedCertificate } = await kmsEncryptor({
+          plainText: Buffer.from(certData.cert)
+        });
+
+        const { cipherTextBlob: encryptedPrivateKey } = await kmsEncryptor({
+          plainText: Buffer.from(certData.privateKey)
+        });
+
+        const { cipherTextBlob: encryptedCertificateChain } = await kmsEncryptor({
+          plainText: Buffer.from(certData.certificateChain || "")
+        });
+
+        await certificateDAL.transaction(async (tx) => {
+          const txCert = await certificateDAL.create(
+            {
+              status: CertStatus.ACTIVE,
+              friendlyName: certName,
+              commonName,
+              altNames,
+              serialNumber,
+              notBefore,
+              notAfter,
+              projectId: pkiSync.projectId,
+              keyUsages: [],
+              extendedKeyUsages: []
+            },
+            tx
+          );
+
+          await certificateBodyDAL.create(
+            {
+              certId: txCert.id,
+              encryptedCertificate,
+              encryptedCertificateChain
+            },
+            tx
+          );
+
+          await certificateSecretDAL.create(
+            {
+              certId: txCert.id,
+              encryptedPrivateKey
+            },
+            tx
+          );
+
+          return txCert;
+        });
+
+        createdCertificates.push(certName);
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        failedCertificates.push({ name: certName, error: errorMsg });
+
+        throw new PkiSyncError({
+          message: `Failed to import certificate '${certName}': ${errorMsg}`,
+          cause: error instanceof Error ? error : new Error(errorMsg),
+          context: { syncId: pkiSync.id, certName }
+        });
+      }
+    }
+
+    return certificateMap;
   };
 
   const $handleSyncCertificatesJob = async (job: TPkiSyncSyncCertificatesDTO, pkiSync: TPkiSyncRaw) => {
@@ -462,7 +596,7 @@ export const pkiSyncQueueFactory = ({
     let isFinalAttempt = job.attemptsStarted === job.opts.attempts;
 
     try {
-      await $importCertificates();
+      await $importCertificates(job, pkiSync);
 
       isSuccess = true;
     } catch (err) {
